@@ -654,7 +654,7 @@ const server = net.createServer(socket => {
           locationDoc[key] === undefined && delete locationDoc[key]
         );
 
-        await Location.create(locationDoc);
+        await saveWithRetry(() => Location.create(locationDoc));
         console.log(`✓ ${packet.packetType} packet saved to MongoDB for IMEI: ${packet.imei}`);
       }
       
@@ -677,6 +677,36 @@ const server = net.createServer(socket => {
   
   socket.on('error', err => console.error('✗ Socket error:', err));
 });
+
+// Transient topology errors (primary failover, stale routing table) surface
+// as a one-shot error that the driver resolves on the next heartbeat. A short
+// retry loop keeps these packets from being dropped.
+const RETRYABLE_CODES = new Set([10107, 13435, 13436, 189, 91, 11600, 11602]);
+
+function isRetryable(err) {
+  if (!err) return false;
+  if (typeof err.hasErrorLabel === 'function' && err.hasErrorLabel('RetryableWriteError')) return true;
+  if (err.code && RETRYABLE_CODES.has(err.code)) return true;
+  const msg = (err.message || '').toLowerCase();
+  return msg.includes('marked stale')
+      || msg.includes('not primary')
+      || msg.includes('not writable primary')
+      || msg.includes('no primary');
+}
+
+async function saveWithRetry(fn, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryable(err) || i === attempts - 1) throw err;
+      await new Promise(r => setTimeout(r, 200 * (i + 1))); // 200ms, 400ms
+    }
+  }
+  throw lastErr;
+}
 
 server.listen(PORT, () => {
   console.log(`GT06 server listening on port ${PORT}`);
